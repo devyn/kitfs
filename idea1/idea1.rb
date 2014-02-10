@@ -1,55 +1,83 @@
 #!/usr/bin/env ruby
 
 require 'sequel'
+require 'rfusefs'
 
-DB = Sequel.connect("postgres:///KitFS_idea1")
+module Idea1
+  extend self
 
-def locate(path, origin=0)
-  path.each_with_index do |relation_name, index|
-    origin = DB[:relations].filter(source: origin, name: relation_name)
-                           .select_map(:destination).first
+  DB = Sequel.connect("postgres:///KitFS_idea1")
 
-    if origin.nil?
-      raise "relation '#{relation_name}' not found on '#{
-        path[0, index].join("/")}'"
+  COMMANDS = [
+    [:put,    ["relpath"], [],
+      -> (*args, &cmd) { cmd.(*(args + [$stdin.read])) }],
+
+    [:get,    ["relpath"], [],
+      -> (*args, &cmd) { $stdout << cmd.(*args) }],
+
+    [:link,   ["srcpath", "destpath"], []],
+
+    [:unlink, ["relpath"], []],
+
+    [:list,   [], ["relpath"]],
+
+    [:mount,  ["directory"], []]
+  ]
+
+  def locate(path, origin=0)
+    if path.is_a? String
+      path = path.split("/")
+    end
+
+    path.each_with_index do |relation_name, index|
+      origin = DB[:relations].filter(source: origin, name: relation_name)
+                             .select_map(:destination).first
+
+      if origin.nil?
+        raise "relation '#{relation_name}' not found on '#{
+          path[0, index].join("/")}'"
+      end
+    end
+
+    return origin
+  end
+
+  def put(relpath, input)
+    contents = !input.nil? ? Sequel.blob(input) : nil
+
+    begin
+      # try to replace existing file
+      file_id = locate(relpath.split("/"))
+
+      DB[:files].filter(id: file_id).update(contents: contents)
+    rescue
+      # create new file and link
+      parent_path = relpath.split("/")
+      name        = parent_path.pop
+
+      parent = locate(parent_path)
+
+      DB.transaction do
+        file = DB[:files].insert(contents: contents)
+
+        DB[:relations].insert(source: parent, name: name, destination: file)
+      end
     end
   end
 
-  return origin
-end
+  def get(relpath)
+    file_id = locate(relpath)
 
-def put(relpath)
-  parent_path = relpath.split("/")
-  name        = parent_path.pop
+    c = DB[:files].filter(id: file_id).select_map(:contents).first
 
-  begin
-    parent = locate(parent_path)
-  rescue
-    warn "Error: #$!"
-    return 1
+    if c.nil?
+      ""
+    else
+      c
+    end
   end
 
-  file = DB[:files].insert(contents: Sequel.blob($stdin.read))
-
-  DB[:relations].insert(source: parent, name: name, destination: file)
-
-  return 0
-end
-
-def get(relpath)
-  begin
-    file_id = locate(relpath.split("/"))
-  rescue
-    warn "Error: #$!"
-    return 1
-  end
-
-  $stdout << DB[:files].filter(id: file_id).select_map(:contents).first
-
-  return 0
-end
-
-LIST_QUERY = <<-SQL
+  LIST_QUERY = <<-SQL
 SELECT
   r1.destination AS file_id,
   count(r2.id) AS subrelations,
@@ -71,110 +99,193 @@ ORDER BY
   r1.name ASC;
 SQL
 
-def list(relpath="")
-  begin
-    file_id = locate(relpath.split("/"))
-  rescue
-    warn "Error: #$!"
-    return 1
+  def list(relpath="")
+    begin
+      file_id = locate(relpath)
+    rescue
+      warn "Error: #$!"
+      return 1
+    end
+
+    headings = ["file ID", "subrelations", "bytes", "name"]
+
+    printf "%-15s %-15s %-15s %s\n", *headings
+
+    printf "%-15s %-15s %-15s %s\n", *headings.map {|s| s.gsub(/./, "-")}
+
+    results = DB[LIST_QUERY, file_id].all
+    
+    results.each do |relation|
+      printf "%-15s %-15s %-15s %s\n",
+        relation[:file_id], relation[:subrelations],
+        relation[:bytes], relation[:name]
+    end
+
+    puts
+    puts "Total: #{results.count} relations"
+
+    return 0
   end
 
-  headings = ["file ID", "subrelations", "bytes", "name"]
+  def link(srcpath, destpath)
+    srcfile_id = locate(srcpath)
 
-  printf "%-15s %-15s %-15s %s\n", *headings
+    parent_path = destpath.split("/")
+    name        = parent_path.pop
 
-  printf "%-15s %-15s %-15s %s\n", *headings.map {|s| s.gsub(/./, "-")}
-
-  results = DB[LIST_QUERY, file_id].all
-  
-  results.each do |relation|
-    printf "%-15s %-15s %-15s %s\n",
-      relation[:file_id], relation[:subrelations],
-      relation[:bytes], relation[:name]
-  end
-
-  puts
-  puts "Total: #{results.count} relations"
-
-  return 0
-end
-
-def link(srcpath, destpath)
-  begin
-    srcfile_id = locate(srcpath.split("/"))
-  rescue
-    warn "Error: #$!"
-    return 1
-  end
-
-  parent_path = destpath.split("/")
-  name        = parent_path.pop
-
-  begin
     parent = locate(parent_path)
-  rescue
-    warn "Error: #$!"
-    return 1
+
+    DB[:relations].insert(source: parent, name: name, destination: srcfile_id)
+
+    return 0
   end
 
-  DB[:relations].insert(source: parent, name: name, destination: srcfile_id)
+  def unlink(relpath)
+    parent_path = relpath.split("/")
+    name        = parent_path.pop
 
-  return 0
-end
-
-def unlink(relpath)
-  parent_path = relpath.split("/")
-  name        = parent_path.pop
-
-  begin
     parent = locate(parent_path)
-  rescue
-    warn "Error: #$!"
-    return 1
+
+    if relation = DB[:relations][source: parent, name: name]
+      DB[:relations].filter(id: relation[:id]).delete
+
+      # TODO: cleanup
+    else
+      raise "relation '#{name}' not found on '#{parent_path.join("/")}'"
+    end
   end
 
-  if relation = DB[:relations][source: parent, name: name]
-    DB[:relations].filter(id: relation[:id]).delete
+  class FS < FuseFS::FuseDir
+    def contents(path)
+      file_id = Idea1.locate(from_dir_path(path))
 
-    # TODO: cleanup
-  else
-    warn "Error: relation '#{name}' not found on '#{parent_path.join("/")}'"
-    return 1
+      DB[:relations].filter(source: file_id).select_map(:name)
+    end
+
+    def directory?(path)
+      begin
+        Idea1.locate(from_dir_path(path))
+        true
+      rescue
+        false
+      end
+    end
+
+    def file?(path)
+      if path =~ /^(.*)=$/
+        directory? $1
+      else
+        false
+      end
+    end
+
+    def read_file(path)
+      Idea1.get(from_path(path))
+    end
+
+    def size(path)
+      file_id = Idea1.locate(from_path(path))
+
+      DB[:files].filter(id: file_id)
+        .select_map(Sequel.function(:octet_length, :contents)).first
+    end
+
+    def can_write?(path)
+      directory?(path.split("/")[0..-2].join("/"))
+    end
+
+    def write_to(path, body)
+      Idea1.put(from_path(path), body)
+    end
+
+    def can_delete?(path)
+      file?(path) || directory?(path)
+    end
+
+    def delete(path)
+      Idea1.unlink(from_path(path))
+    end
+
+    def can_mkdir?(path)
+      !file?(path) && directory?(path.split("/")[0..-2].join("/"))
+    end
+
+    def mkdir(path)
+      Idea1.put(from_dir_path(path), nil)
+    end
+
+    def can_rmdir?(path)
+      directory?(path)
+    end
+
+    def rmdir(path)
+      Idea1.unlink(from_dir_path(path))
+    end
+
+    private
+
+    def from_dir_path(path)
+      path.sub(/^\//, '')
+    end
+
+    def from_path(path)
+      from_dir_path(path).sub(/=$/, '')
+    end
+  end
+
+  def mount(directory)
+    if File.directory?(directory)
+      fork do
+        Process.setsid
+        FuseFS.set_root(FS.new)
+        FuseFS.mount_under(directory)
+        FuseFS.run
+      end
+    else
+      raise "no such directory: '#{directory}'"
+    end
   end
 end
 
 def interpret(command, *args)
-  case command
-  when "put", "get", "unlink"
-    if args.count == 1
-      return send(command, *args)
+  if c = Idea1::COMMANDS.find { |c| c[0].to_s == command.to_s }
+    command_name, required, optional, block = c
+
+    if args.count >= required.count and
+       args.count <= required.count + optional.count
+
+      block ||= -> (*args, &cmd) { cmd.(*args) }
+
+      block.(*args) { |*new_args|
+        Idea1.send(command_name, *new_args)
+      }
+      return 0
     else
-      warn "Usage: #$0 #{command} <relpath>"
+      param_list = [command_name] + required.map { |o| "<#{o}>" }\
+                                  + optional.map { |o| "[<#{o}>]" }
+      warn "Usage: #$0 #{param_list.join(" ")}"
       return 1
     end
-  when "link"
-    if args.count == 2
-      return link(*args)
-    else
-      warn "Usage: #$0 link <srcpath> <destpath>"
-    end
-  when "list"
-    return list(*args)
   else
     warn "Unrecognized command."
     return 1
   end
+rescue
+  warn "Error: #$!"
+  return 1
 end
 
 if ARGV[0]
   exit(interpret(*ARGV))
 else
-  warn "Usage: #$0",
-       "         put    <relpath>",
-       "         get    <relpath>",
-       "         link   <relpath>",
-       "         unlink <relpath>",
-       "         list   <relpath>"
+  warn "Usage: #$0"
+
+  Idea1::COMMANDS.each do |c|
+    command_name, required, optional, block = c
+    param_list = [command_name] + required.map { |o| "<#{o}>" }\
+                                + optional.map { |o| "[<#{o}>]" }
+    warn "         #{param_list.join(" ")}"
+  end
 
   exit 1
 end
